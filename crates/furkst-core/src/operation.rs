@@ -107,7 +107,7 @@ impl Operation {
             Self::Commit { amend: true, .. } => "Amend last commit".into(),
             Self::Commit { .. } => "Commit".into(),
             Self::ResolveConflict { change, ours } => {
-                format!("Resolve {} using {}", change.path, if *ours { "ours" } else { "theirs" })
+                format!("Resolve {} using the {} version", change.path, if *ours { "current" } else { "incoming" })
             }
             Self::ResolveMerged { change, .. } => format!("Resolve conflicts in {}", change.path),
             Self::SaveFileAt { path, destination, .. } => format!("Save {path} to {}", destination.display()),
@@ -165,6 +165,22 @@ impl Operation {
                 | Self::LfsPull
                 | Self::LfsFetch
                 | Self::LfsTrack { .. }
+        )
+    }
+
+    /// Whether it can stop half way on conflicts, leaving them to resolve.
+    pub fn may_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Merge { .. }
+                | Self::Rebase { .. }
+                | Self::InteractiveRebase { .. }
+                | Self::CherryPick { .. }
+                | Self::Revert { .. }
+                | Self::Pull { .. }
+                | Self::StashApply { .. }
+                | Self::FlowFinish { .. }
+                | Self::Continue(_)
         )
     }
 

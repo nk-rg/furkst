@@ -138,7 +138,12 @@ impl WorkingStatus {
     }
 
     pub fn has_conflicts(&self) -> bool {
-        self.unstaged.iter().any(|c| c.kind == ChangeKind::Conflicted)
+        self.conflicted().next().is_some()
+    }
+
+    /// The files with unresolved conflicts.
+    pub fn conflicted(&self) -> impl Iterator<Item = &FileChange> {
+        self.unstaged.iter().filter(|c| c.kind == ChangeKind::Conflicted)
     }
 }
 
@@ -162,6 +167,18 @@ impl InProgress {
             Self::Revert => "Reverting",
             Self::Bisect => "Bisecting",
             Self::ApplyMailbox => "Applying patches",
+        }
+    }
+
+    /// The operation as a noun, as in "Abort merge".
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+            Self::Bisect => "bisect",
+            Self::ApplyMailbox => "patch series",
         }
     }
 

@@ -4,7 +4,7 @@ use egui::{RichText, TextEdit, Ui};
 use furkst_core::{ChangeKind, DiffTarget, FileChange, Operation, WorkingStatus};
 
 use super::selection::Selection;
-use super::{Action, RepoTab, files, menus};
+use super::{Action, RepoTab, files, menus, resolver};
 use crate::settings::Settings;
 use crate::widgets;
 
@@ -46,9 +46,6 @@ impl CommitForm {
 }
 
 pub fn show(ui: &mut Ui, tab: &mut RepoTab, settings: &mut Settings, actions: &mut Vec<Action>) {
-    if let Some(operation) = tab.status.operation {
-        in_progress_banner(ui, operation, tab.status.has_conflicts(), actions);
-    }
     widgets::left_panel(ui, "changes_lists", 380.0).show(ui, |ui| {
         egui::Panel::bottom("commit_form").show(ui, |ui| commit_form(ui, tab, actions));
         file_lists(ui, tab, actions);
@@ -70,7 +67,32 @@ pub fn diff(ui: &mut Ui, tab: &mut RepoTab, settings: &mut Settings, in_window: 
     if tab.selections.is_multiple() {
         return widgets::placeholder(ui, &format!("{} files selected", tab.selections.count()));
     }
+    if let Some((DiffTarget::Unstaged, change)) = tab.diff.key()
+        && change.kind == ChangeKind::Conflicted
+    {
+        return conflicted_file(ui, &change.clone(), actions);
+    }
     tab.diff.show(ui, settings, Action::SelectFile, Some(in_window), actions);
+}
+
+/// In place of a conflicted file's diff (whose staging buttons don't apply to it), the ways to resolve it.
+fn conflicted_file(ui: &mut Ui, change: &FileChange, actions: &mut Vec<Action>) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(ui.available_height() / 3.0);
+        ui.heading(format!("{} has conflicts", change.file_name()));
+        ui.add_space(6.0);
+        ui.label(RichText::new("Both sides changed the same lines. Choose what to keep in the Conflicts window, or keep one side for the whole file.").weak());
+        ui.add_space(12.0);
+        if ui.button(RichText::new("Resolve conflicts…").strong()).clicked() {
+            actions.push(Action::Resolve(Some(change.clone())));
+        }
+        ui.add_space(4.0);
+        for (label, tooltip, ours) in resolver::WHOLE_FILE {
+            if ui.button(label).on_hover_text(tooltip).clicked() {
+                actions.push(resolver::take_side(change, ours));
+            }
+        }
+    });
 }
 
 /// The selections of the unstaged and staged lists; only one of them is ever non-empty.
@@ -167,7 +189,7 @@ fn file_section(
                 && !staged
                 && change.kind == ChangeKind::Conflicted
             {
-                actions.push(Action::Resolve(change.clone()));
+                actions.push(Action::Resolve(Some(change.clone())));
             } else if !outcome.activated.is_empty() {
                 actions.push(Action::Run(toggle(staged, outcome.activated)));
             }
@@ -200,9 +222,9 @@ fn file_menu(ui: &mut Ui, targets: &[FileChange], staged: bool, actions: &mut Ve
     let count = if targets.len() > 1 { format!(" {} files", targets.len()) } else { String::new() };
     match targets {
         [change] if !staged && change.kind == ChangeKind::Conflicted => {
-            menus::item(ui, "Resolve conflicts…", actions, || Action::Resolve(change.clone()));
-            for (label, ours) in [("Resolve using mine", true), ("Resolve using theirs", false)] {
-                menus::item(ui, label, actions, || Action::Run(Operation::ResolveConflict { change: change.clone(), ours }));
+            menus::item(ui, "Resolve conflicts…", actions, || Action::Resolve(Some(change.clone())));
+            for (label, _, ours) in resolver::WHOLE_FILE {
+                menus::item(ui, label, actions, || resolver::take_side(change, ours));
             }
             menus::item(ui, "Mark as resolved", actions, || Action::Run(toggle(false, targets.to_vec())));
         }
@@ -263,21 +285,40 @@ fn commit_form(ui: &mut Ui, tab: &mut RepoTab, actions: &mut Vec<Action>) {
     ui.add_space(4.0);
 }
 
-fn in_progress_banner(ui: &mut Ui, operation: furkst_core::InProgress, conflicts: bool, actions: &mut Vec<Action>) {
+/// What is in progress (a merge, a rebase…) and the conflicts left, with the ways on: resolve, continue or abort.
+pub fn in_progress_banner(ui: &mut Ui, status: &WorkingStatus, actions: &mut Vec<Action>) {
+    let conflicts = status.conflicted().count();
     egui::Frame::new().fill(ui.visuals().warn_fg_color.gamma_multiply(0.15)).inner_margin(8.0).show(ui, |ui| {
+        ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            let hint = if conflicts { "Resolve the conflicts, then continue." } else { "Ready to continue." };
-            ui.label(RichText::new(format!("{} in progress. {hint}", operation.label())).strong());
+            let what = status.operation.map_or("Applying changes", |op| op.label());
+            let hint = match conflicts {
+                0 => "all conflicts are resolved.".to_owned(),
+                1 => "1 file has conflicts.".to_owned(),
+                n => format!("{n} files have conflicts."),
+            };
+            ui.label(RichText::new(format!("{what}: {hint}")).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Abort").clicked() {
-                    actions.push(Action::Confirm {
-                        title: format!("Abort {}", operation.label().to_lowercase()),
-                        message: "All progress of the current operation will be lost.".into(),
-                        op: Operation::Abort(operation),
-                    });
+                if let Some(operation) = status.operation {
+                    if ui.button(format!("Abort {}…", operation.name())).clicked() {
+                        actions.push(Action::Confirm {
+                            title: format!("Abort {}", operation.name()),
+                            message: format!(
+                                "Go back to how everything was before the {}? Anything resolved so far is lost.",
+                                operation.name()
+                            ),
+                            op: Operation::Abort(operation),
+                        });
+                    }
+                    if operation.command().is_some()
+                        && conflicts == 0
+                        && ui.button(RichText::new(format!("Continue {}", operation.name())).strong()).clicked()
+                    {
+                        actions.push(Action::Run(Operation::Continue(operation)));
+                    }
                 }
-                if operation.command().is_some() && ui.add_enabled(!conflicts, egui::Button::new("Continue")).clicked() {
-                    actions.push(Action::Run(Operation::Continue(operation)));
+                if conflicts > 0 && ui.button(RichText::new("Resolve conflicts…").strong()).clicked() {
+                    actions.push(Action::Resolve(None));
                 }
             });
         });

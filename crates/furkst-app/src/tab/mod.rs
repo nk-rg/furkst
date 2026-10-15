@@ -96,8 +96,8 @@ pub enum Action {
     SelectVersion(Oid),
     /// Load the file history window's diff again (after the diff options changed).
     ShowVersionDiff(DiffTarget, FileChange),
-    /// Open the merge conflict resolver for a conflicted file.
-    Resolve(FileChange),
+    /// Open the Conflicts window at this conflicted file, or where it was (at the first conflicted file) for `None`.
+    Resolve(Option<FileChange>),
     Blame { path: String, at: Oid },
     /// Show where `HEAD` has been, to recover from resets, rebases and deleted branches.
     ShowReflog,
@@ -124,7 +124,17 @@ enum Msg {
     SearchPrepared,
     Details(Oid, Loaded<CommitDetails>),
     Diff { pane: DiffPane, generation: u64, result: Loaded<FileDiff> },
-    Operation { description: String, result: Loaded<String>, changes_refs: bool, is_commit: bool, is_fetch: bool },
+    Operation {
+        description: String,
+        result: Loaded<String>,
+        changes_refs: bool,
+        is_commit: bool,
+        is_fetch: bool,
+        /// Whether it continued or aborted what was in progress.
+        finishes: bool,
+        /// The conflicts it stopped on, when it failed because of them.
+        stopped: Option<resolver::Stopped>,
+    },
     /// A background fetch: failures only go to the git output log.
     AutoFetch(Loaded<String>),
     FileHistory { path: String, result: Loaded<Vec<CommitInfo>> },
@@ -157,7 +167,10 @@ pub struct RepoTab {
     sidebar: sidebar::SidebarState,
     dialog: Option<Dialog>,
     tools: tools::Tools,
-    resolver: Option<resolver::Resolver>,
+    /// The Conflicts window, while open.
+    conflicts: Option<resolver::ConflictsWindow>,
+    /// Asking what to do about the conflicts an operation just stopped on.
+    conflict_prompt: Option<resolver::Stopped>,
     log: Vec<LogEntry>,
     show_log: bool,
     auto_fetch: autofetch::AutoFetch,
@@ -208,7 +221,8 @@ impl RepoTab {
             sidebar: sidebar::SidebarState::default(),
             dialog: None,
             tools: tools::Tools::default(),
-            resolver: None,
+            conflicts: None,
+            conflict_prompt: None,
             log: Vec::new(),
             show_log: false,
             auto_fetch: autofetch::AutoFetch::new(std::time::Instant::now()),
@@ -268,6 +282,11 @@ impl RepoTab {
         egui::Panel::top("toolbar").show(ui, |ui| {
             toolbar::show(ui, self, settings, &mut actions);
         });
+        if self.status.operation.is_some() || self.status.has_conflicts() {
+            egui::Panel::top("in_progress")
+                .frame(egui::Frame::new())
+                .show(ui, |ui| changes::in_progress_banner(ui, &self.status, &mut actions));
+        }
         egui::Panel::bottom("statusbar").show(ui, |ui| self.status_bar(ui));
         if ui.input_mut(|i| i.consume_key(CHANGES_WINDOW_KEYS, egui::Key::M)) {
             actions.push(Action::ToggleChangesWindow);
@@ -295,7 +314,7 @@ impl RepoTab {
         }
         tools::show(ui.ctx(), &mut self.tools, self.refs.as_ref(), settings, &mut actions);
         self.quick_launch(ui.ctx(), settings, &mut actions);
-        resolver::show(ui.ctx(), &mut self.resolver, &mut actions);
+        self.conflicts_window(ui.ctx(), &mut actions);
         self.error_window(ui.ctx());
         self.log_window(ui.ctx());
 
@@ -395,7 +414,10 @@ impl RepoTab {
                     Msg::FileHistory { result: repo.history(&query).map_err(|e| e.to_string()), path }
                 });
             }
-            Action::Resolve(change) => self.resolver = Some(resolver::Resolver::open(&self.repo, change)),
+            Action::Resolve(change) => {
+                let change = change.or_else(|| self.status.conflicted().next().cloned());
+                self.conflicts.get_or_insert_with(Default::default).select(&self.repo, change);
+            }
             Action::Blame { path, at } => {
                 self.tools.open_blame(&path);
                 self.spawn(move |repo| Msg::Blame { result: repo.blame(&path, at).map_err(|e| e.to_string()), path });
@@ -454,14 +476,14 @@ impl RepoTab {
         let changes_refs = op.changes_refs();
         let is_commit = matches!(op, Operation::Commit { .. });
         let is_fetch = matches!(op, Operation::Fetch { .. });
+        let finishes = matches!(op, Operation::Continue(_) | Operation::Abort(_));
+        let may_conflict = op.may_conflict();
         self.operations += 1;
         let progress = self.progress.clone();
-        self.spawn(move |repo| Msg::Operation {
-            result: op.run_with_progress(repo, &|line| progress.report(line)).map_err(|e| e.to_string()),
-            description,
-            changes_refs,
-            is_commit,
-            is_fetch,
+        self.spawn(move |repo| {
+            let result = op.run_with_progress(repo, &|line| progress.report(line)).map_err(|e| e.to_string());
+            let stopped = (result.is_err() && may_conflict).then(|| resolver::Stopped::after_failure(repo)).flatten();
+            Msg::Operation { result, description, changes_refs, is_commit, is_fetch, finishes, stopped }
         });
     }
 
@@ -515,6 +537,21 @@ impl RepoTab {
                 View::LocalChanges => changes::diff(ui, self, settings, true, actions),
             });
         });
+    }
+
+    /// The prompt after an operation stopped on conflicts, and the Conflicts window while it is open.
+    fn conflicts_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if let Some(stopped) = &self.conflict_prompt
+            && resolver::prompt(ctx, stopped, actions)
+        {
+            self.conflict_prompt = None;
+        }
+        let name = self.title();
+        let Some(window) = &mut self.conflicts else { return };
+        let id = egui::ViewportId::from_hash_of(("conflicts", self.repo.workdir()));
+        if resolver::show(ctx, window, &self.status, &name, id, actions) {
+            self.conflicts = None;
+        }
     }
 
     /// Shows how the file history window's file changed in `id`.
@@ -718,7 +755,7 @@ impl RepoTab {
                         panel.finish(generation, result);
                     }
                 }
-                Msg::Operation { description, result, changes_refs, is_commit, is_fetch } => {
+                Msg::Operation { description, result, changes_refs, is_commit, is_fetch, finishes, stopped } => {
                     self.operations -= 1;
                     // The operation's own file changes are covered by the refresh below.
                     self.watcher.discard();
@@ -726,10 +763,21 @@ impl RepoTab {
                     if is_fetch && result.is_ok() {
                         self.auto_fetch.succeeded(std::time::Instant::now());
                     }
-                    if let Err(error) = &result {
-                        self.error = Some(error.clone());
-                    } else if is_commit {
-                        self.commit_form.clear();
+                    match (&result, stopped) {
+                        // The Conflicts window, when open, takes the new conflicts in (the next commit of a rebase).
+                        (Err(_), Some(_)) if self.conflicts.is_some() => {}
+                        // Stopping on conflicts is expected, not an error: say so and offer the ways on.
+                        (Err(_), Some(stopped)) => self.conflict_prompt = Some(stopped),
+                        (Err(error), None) => self.error = Some(error.clone()),
+                        (Ok(_), _) => {
+                            if is_commit {
+                                self.commit_form.clear();
+                            }
+                            // Whatever was in progress is over.
+                            if is_commit || finishes {
+                                self.conflicts = None;
+                            }
+                        }
                     }
                     self.log.push(LogEntry { description, output: result });
                     if changes_refs {

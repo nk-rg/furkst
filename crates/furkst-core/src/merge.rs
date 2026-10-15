@@ -34,10 +34,10 @@ impl Resolution {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Ours => "Use ours",
-            Self::Theirs => "Use theirs",
-            Self::OursThenTheirs => "Ours, then theirs",
-            Self::TheirsThenOurs => "Theirs, then ours",
+            Self::Ours => "Accept current",
+            Self::Theirs => "Accept incoming",
+            Self::OursThenTheirs => "Accept both",
+            Self::TheirsThenOurs => "Accept both, incoming first",
         }
     }
 }
