@@ -286,7 +286,7 @@ fn rebase_and_merge_replays_commits_without_moving_the_branch() {
     t.git(&["checkout", "-"]);
     commit("main.txt", "main moves on");
 
-    t.run(Operation::Merge { target: "feature".into(), style: MergeStyle::Rebase });
+    t.run(Operation::Merge { target: "feature".into(), style: MergeStyle::Rebase, stash: false });
     let subjects = t.git(&["log", "--format=%s"]);
     assert_eq!(subjects.lines().collect::<Vec<_>>(), ["feature two", "feature one", "main moves on", "base"], "replayed on top");
     assert!(t.git(&["rev-list", "--merges", "HEAD"]).trim().is_empty(), "no merge commit");
@@ -294,7 +294,7 @@ fn rebase_and_merge_replays_commits_without_moving_the_branch() {
 
     // Behind the branch: its commits are taken as they are.
     t.git(&["checkout", "-b", "behind", "HEAD~3"]);
-    t.run(Operation::Merge { target: "feature".into(), style: MergeStyle::Rebase });
+    t.run(Operation::Merge { target: "feature".into(), style: MergeStyle::Rebase, stash: false });
     assert_eq!(t.git(&["rev-parse", "HEAD"]), feature_tip, "fast-forwarded");
 }
 
@@ -509,6 +509,62 @@ fn resolve_merge_conflict_with_mixed_choices() {
     assert!(!status.has_conflicts());
     assert!(status.unstaged.is_empty(), "{:?}", status.unstaged);
     assert!(status.staged.iter().any(|c| c.path == "a.txt"));
+}
+
+/// Ten numbered lines, with `first` as the first one and `fifth` as the fifth.
+fn lines_with(first: &str, fifth: &str) -> String {
+    (1..=10)
+        .map(|n| match n {
+            1 => format!("{first}\n"),
+            5 => format!("{fifth}\n"),
+            n => format!("line {n}\n"),
+        })
+        .collect()
+}
+
+/// A repository whose `topic` branch changed the first line of a.txt, with `main` checked out.
+fn topic_changes_first_line(name: &str) -> TempRepo {
+    let t = TempRepo::new(name);
+    t.write("a.txt", &lines_with("line 1", "line 5"));
+    t.git(&["add", "."]);
+    t.git(&["commit", "-m", "base"]);
+    t.git(&["checkout", "-b", "topic"]);
+    t.write("a.txt", &lines_with("topic 1", "line 5"));
+    t.git(&["commit", "-am", "topic"]);
+    t.git(&["checkout", "-"]);
+    t
+}
+
+#[test]
+fn merge_with_uncommitted_changes_set_aside() {
+    let t = topic_changes_first_line("merge-stash");
+    t.write("a.txt", &lines_with("line 1", "mine 5"));
+    let merge = Operation::Merge { target: "topic".into(), style: furkst_core::MergeStyle::MergeCommit, stash: false };
+    let refused = merge.clone().run(&t.repo).unwrap_err().to_string();
+    assert!(furkst_core::blocked_by_local_changes(&refused), "{refused}");
+
+    t.run(merge.with_stash().unwrap());
+    assert_eq!(t.read("a.txt"), lines_with("topic 1", "mine 5"), "merged, with the changes back");
+    assert!(t.repo.refs().unwrap().stashes.is_empty());
+}
+
+#[test]
+fn changes_set_aside_wait_for_the_conflicts() {
+    let t = topic_changes_first_line("merge-stash-conflict");
+    t.write("a.txt", &lines_with("main 1", "line 5"));
+    t.git(&["commit", "-am", "main"]);
+    t.write("a.txt", &lines_with("main 1", "mine 5"));
+    let merge = Operation::Merge { target: "topic".into(), style: furkst_core::MergeStyle::FastForward, stash: true };
+    let stopped = merge.run(&t.repo).unwrap_err().to_string();
+    assert!(furkst_core::kept_aside(&stopped), "{stopped}");
+    assert_eq!(t.repo.refs().unwrap().stashes.len(), 1);
+
+    let change = t.repo.status().unwrap().conflicted().next().cloned().unwrap();
+    t.run(Operation::ResolveMerged { change, content: lines_with("both 1", "line 5") });
+    t.run(Operation::Commit { message: "Merge topic".into(), amend: false });
+    t.run(Operation::RestoreSetAside);
+    assert_eq!(t.read("a.txt"), lines_with("both 1", "mine 5"));
+    assert!(t.repo.refs().unwrap().stashes.is_empty());
 }
 
 /// A repository stopped merging `topic`, which changed both files, into `main`, which deleted them.
@@ -788,7 +844,7 @@ fn squash_and_merge_commits_one_commit_listing_the_branch() {
         t.run(Operation::Commit { message: format!("Add {name}"), amend: false });
     }
     t.git(&["checkout", "-q", &main]);
-    t.run(Operation::Merge { target: "topic".into(), style: MergeStyle::Squash });
+    t.run(Operation::Merge { target: "topic".into(), style: MergeStyle::Squash, stash: false });
     assert_eq!(t.git(&["log", "--format=%s", "-2"]), "Squashed topic\nbase");
     assert_eq!(t.git(&["log", "-1", "--format=%b"]), "* Add one\n* Add two");
 

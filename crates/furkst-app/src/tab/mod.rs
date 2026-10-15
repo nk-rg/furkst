@@ -134,6 +134,8 @@ enum Msg {
         finishes: bool,
         /// The conflicts it stopped on, when it failed because of them.
         stopped: Option<resolver::Stopped>,
+        /// The same operation with uncommitted changes set aside, for one git may refuse because of them.
+        stash_retry: Option<Operation>,
     },
     /// A background fetch: failures only go to the git output log.
     AutoFetch(Loaded<String>),
@@ -173,6 +175,8 @@ pub struct RepoTab {
     conflicts: Option<resolver::ConflictsWindow>,
     /// Asking what to do about the conflicts an operation just stopped on.
     conflict_prompt: Option<resolver::Stopped>,
+    /// Whether the operation in progress set uncommitted changes aside, to put back once it is finished or aborted.
+    changes_set_aside: bool,
     log: Vec<LogEntry>,
     show_log: bool,
     auto_fetch: autofetch::AutoFetch,
@@ -225,6 +229,7 @@ impl RepoTab {
             tools: tools::Tools::default(),
             conflicts: None,
             conflict_prompt: None,
+            changes_set_aside: false,
             log: Vec::new(),
             show_log: false,
             auto_fetch: autofetch::AutoFetch::new(std::time::Instant::now()),
@@ -480,12 +485,13 @@ impl RepoTab {
         let is_fetch = matches!(op, Operation::Fetch { .. });
         let finishes = matches!(op, Operation::Continue(_) | Operation::Abort(_));
         let may_conflict = op.may_conflict();
+        let stash_retry = op.with_stash();
         self.operations += 1;
         let progress = self.progress.clone();
         self.spawn(move |repo| {
             let result = op.run_with_progress(repo, &|line| progress.report(line)).map_err(|e| e.to_string());
-            let stopped = (result.is_err() && may_conflict).then(|| resolver::Stopped::after_failure(repo)).flatten();
-            Msg::Operation { result, description, changes_refs, is_commit, is_fetch, finishes, stopped }
+            let stopped = result.as_ref().err().filter(|_| may_conflict).and_then(|error| resolver::Stopped::after_failure(repo, error));
+            Msg::Operation { result, description, changes_refs, is_commit, is_fetch, finishes, stopped, stash_retry }
         });
     }
 
@@ -758,7 +764,7 @@ impl RepoTab {
                         panel.finish(generation, result);
                     }
                 }
-                Msg::Operation { description, result, changes_refs, is_commit, is_fetch, finishes, stopped } => {
+                Msg::Operation { description, result, changes_refs, is_commit, is_fetch, finishes, stopped, stash_retry } => {
                     self.operations -= 1;
                     // The operation's own file changes are covered by the refresh below.
                     self.watcher.discard();
@@ -767,11 +773,20 @@ impl RepoTab {
                         self.auto_fetch.succeeded(std::time::Instant::now());
                     }
                     let on_conflicts = stopped.is_some();
+                    if result.as_ref().is_err_and(|error| furkst_core::kept_aside(error)) {
+                        self.changes_set_aside = true;
+                    }
                     match (&result, stopped) {
                         // The Conflicts window, when open, takes the new conflicts in (the next commit of a rebase).
                         (Err(_), Some(_)) if self.conflicts.is_some() => {}
                         // Stopping on conflicts is expected, not an error: say so and offer the ways on.
                         (Err(_), Some(stopped)) => self.conflict_prompt = Some(stopped),
+                        // Refused because of uncommitted changes: offer to set them aside.
+                        (Err(error), None) if stash_retry.is_some() && furkst_core::blocked_by_local_changes(error) => {
+                            if let Some(op) = stash_retry {
+                                self.dialog = Some(Dialog::StashFirst { error: error.clone(), op });
+                            }
+                        }
                         (Err(error), None) => self.error = Some(error.clone()),
                         (Ok(_), _) => {
                             if is_commit {
@@ -780,6 +795,9 @@ impl RepoTab {
                             // Whatever was in progress is over.
                             if is_commit || finishes {
                                 self.conflicts = None;
+                                if std::mem::take(&mut self.changes_set_aside) {
+                                    self.run(Operation::RestoreSetAside);
+                                }
                             }
                         }
                     }

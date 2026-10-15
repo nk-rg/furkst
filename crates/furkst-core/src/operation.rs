@@ -57,7 +57,8 @@ pub enum Operation {
     Checkout { target: String },
     CheckoutRemoteBranch { remote_branch: String, local_name: String },
     Fetch { remote: Option<String>, prune: bool },
-    Pull { rebase: bool },
+    /// With `stash`, uncommitted changes are set aside first; see [`Repo::with_changes_aside`].
+    Pull { rebase: bool, stash: bool },
     Push { remote: String, branch: String, set_upstream: bool, force: bool, tags: bool },
     PushTag { remote: String, tag: String },
     DeleteRemoteBranch { remote: String, branch: String },
@@ -66,7 +67,10 @@ pub enum Operation {
     DeleteBranches { local: Option<String>, remote: Option<(String, String)> },
     DeleteRemoteTag { remote: String, tag: String },
     SetUpstream { branch: String, upstream: Option<String> },
-    Merge { target: String, style: MergeStyle },
+    /// With `stash`, uncommitted changes are set aside first; see [`Repo::with_changes_aside`].
+    Merge { target: String, style: MergeStyle, stash: bool },
+    /// Puts back the changes a merge or pull set aside, once it is finished or aborted.
+    RestoreSetAside,
     Rebase { onto: String },
     CherryPick { commit: Oid },
     Revert { commit: Oid },
@@ -135,6 +139,7 @@ impl Operation {
             Self::DeleteRemoteTag { remote, tag } => format!("Delete tag {tag} from {remote}"),
             Self::SetUpstream { branch, .. } => format!("Set upstream of {branch}"),
             Self::Merge { target, .. } => format!("Merge {target}"),
+            Self::RestoreSetAside => "Put back the changes set aside".into(),
             Self::Rebase { onto } => format!("Rebase onto {onto}"),
             Self::CherryPick { commit } => format!("Cherry-pick {}", short_id(commit)),
             Self::Revert { commit } => format!("Revert {}", short_id(commit)),
@@ -172,6 +177,16 @@ impl Operation {
         )
     }
 
+    /// The same operation with uncommitted changes set aside first, for those that offer it (a merge or pull refused
+    /// because of them; see [`blocked_by_local_changes`]).
+    pub fn with_stash(&self) -> Option<Self> {
+        match self {
+            Self::Merge { target, style, stash: false } => Some(Self::Merge { target: target.clone(), style: *style, stash: true }),
+            Self::Pull { rebase, stash: false } => Some(Self::Pull { rebase: *rebase, stash: true }),
+            _ => None,
+        }
+    }
+
     /// Whether it can stop half way on conflicts, leaving them to resolve.
     pub fn may_conflict(&self) -> bool {
         matches!(
@@ -185,6 +200,7 @@ impl Operation {
                 | Self::StashApply { .. }
                 | Self::FlowFinish { .. }
                 | Self::Continue(_)
+                | Self::RestoreSetAside
         )
     }
 
@@ -269,7 +285,10 @@ impl Operation {
                 }
                 git(&args)
             }
-            Self::Pull { rebase } => git(&["pull", "--progress", if rebase { "--rebase" } else { "--no-rebase" }]),
+            Self::Pull { rebase, stash } => {
+                let pull = || git(&["pull", "--progress", if rebase { "--rebase" } else { "--no-rebase" }]);
+                if stash { repo.with_changes_aside("pull", pull) } else { pull() }
+            }
             Self::Push { remote, branch, set_upstream, force, tags } => {
                 let mut args = vec!["push", "--progress"];
                 if set_upstream {
@@ -298,7 +317,11 @@ impl Operation {
                 git(&["branch", &format!("--set-upstream-to={upstream}"), &branch])
             }
             Self::SetUpstream { branch, upstream: None } => git(&["branch", "--unset-upstream", &branch]),
-            Self::Merge { target, style } => repo.merge_branch(&target, style),
+            Self::Merge { target, style, stash: false } => repo.merge_branch(&target, style),
+            Self::Merge { target, style, stash: true } => {
+                repo.with_changes_aside(&format!("merge {target}"), || repo.merge_branch(&target, style))
+            }
+            Self::RestoreSetAside => repo.restore_set_aside(),
             // Uncommitted changes are set aside for the rebase and put back afterwards, rather than refusing to start.
             Self::Rebase { onto } => git(&["rebase", "--autostash", &onto]),
             Self::CherryPick { commit } => git(&["cherry-pick", &commit.to_string()]),

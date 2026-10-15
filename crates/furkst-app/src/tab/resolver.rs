@@ -33,14 +33,16 @@ pub struct Stopped {
     /// What is in progress; `None` when nothing is (applying a stash, a squash merge), so there is nothing to abort.
     pub operation: Option<InProgress>,
     pub files: Vec<FileChange>,
+    /// Whether uncommitted changes were set aside before it, to come back once it is finished or aborted.
+    pub kept_aside: bool,
 }
 
 impl Stopped {
-    /// What a failed operation left behind, if it stopped on conflicts.
-    pub fn after_failure(repo: &Repo) -> Option<Self> {
+    /// What an operation that failed with `error` left behind, if it stopped on conflicts.
+    pub fn after_failure(repo: &Repo, error: &str) -> Option<Self> {
         let status = repo.status().ok()?;
         let files: Vec<FileChange> = status.conflicted().cloned().collect();
-        (!files.is_empty()).then_some(Self { operation: status.operation, files })
+        (!files.is_empty()).then_some(Self { operation: status.operation, files, kept_aside: furkst_core::kept_aside(error) })
     }
 }
 
@@ -78,6 +80,9 @@ pub fn prompt(ctx: &egui::Context, stopped: &Stopped, actions: &mut Vec<Action>)
             None => "Choose what to keep in each, then commit.".to_owned(),
         };
         ui.label(RichText::new(next).weak());
+        if stopped.kept_aside {
+            ui.label(RichText::new("Your uncommitted changes are set aside in a stash; they come back once this is finished or aborted.").weak());
+        }
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button(RichText::new("Resolve conflicts").strong()).clicked() {

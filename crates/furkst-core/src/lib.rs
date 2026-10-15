@@ -36,7 +36,7 @@ pub use gitflow::{FlowConfig, FlowKind};
 pub use graph::{GraphLine, GraphRow, Half, MAX_LANES, layout as layout_graph};
 pub use history::{CommitSearch, HistoryQuery, SearchHit};
 pub use lfs::LfsPointer;
-pub use merging::MergeStyle;
+pub use merging::{MergeStyle, blocked_by_local_changes, kept_aside};
 pub use merge::{ConflictRegion, ConflictSides, Resolution, Segment, assemble, conflict_count, lines, parse_conflicts};
 pub use model::*;
 pub use operation::{Operation, ResetMode};

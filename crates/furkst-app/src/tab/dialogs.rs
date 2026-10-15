@@ -29,6 +29,9 @@ pub enum Dialog {
     RemoveWorktree { path: PathBuf, force: bool },
     /// A local branch and the remote one that goes with it: each deleted when ticked. `remote` is (remote, branch).
     DeleteBranch { local: Option<String>, remote: Option<(String, String)>, delete_local: bool, delete_remote: bool },
+    /// git refused `op` (a merge or pull) because of uncommitted changes, `error` saying which: offer it again with
+    /// them set aside.
+    StashFirst { error: String, op: Operation },
 }
 
 pub enum Outcome {
@@ -126,6 +129,7 @@ impl Dialog {
             Self::AddWorktree { .. } => "Add worktree",
             Self::RemoveWorktree { .. } => "Remove worktree",
             Self::DeleteBranch { .. } => "Delete branch",
+            Self::StashFirst { .. } => "Uncommitted changes",
         }
     }
 
@@ -156,6 +160,8 @@ impl Dialog {
             Self::AddRemote { .. } | Self::AddWorktree { .. } => "Add",
             Self::RemoveWorktree { .. } => "Remove",
             Self::DeleteBranch { .. } => "Delete",
+            Self::StashFirst { op: Operation::Pull { .. }, .. } => "Stash and pull",
+            Self::StashFirst { .. } => "Stash and merge",
         }
     }
 
@@ -164,6 +170,24 @@ impl Dialog {
         match self {
             Self::Confirm { message, .. } => {
                 ui.label(message.as_str());
+            }
+            Self::StashFirst { error, op } => {
+                let what = if matches!(op, Operation::Pull { .. }) { "pull" } else { "merge" };
+                // git lists the files indented by a tab.
+                let files: Vec<&str> = error.lines().filter_map(|line| line.strip_prefix('\t')).collect();
+                if files.is_empty() {
+                    ui.label(error.as_str());
+                } else {
+                    ui.label(format!("The {what} would overwrite your uncommitted changes to:"));
+                    for file in files {
+                        ui.label(RichText::new(file.trim()).strong());
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!(
+                    "Furkst can set them aside in a stash, {what}, and put them back afterwards; if the {what} stops on conflicts, they come back once it is finished or aborted."
+                ))
+                .weak());
             }
             Self::CreateBranch { at_label, name, checkout, .. } => {
                 ui.label(format!("Starting at {at_label}"));
@@ -284,7 +308,7 @@ impl Dialog {
     pub(super) fn action(&self) -> Option<Action> {
         let valid = |s: &str| is_valid_ref_name(s.trim()).then(|| s.trim().to_owned());
         Some(Action::Run(match self {
-            Self::Confirm { op, .. } => op.clone(),
+            Self::Confirm { op, .. } | Self::StashFirst { op, .. } => op.clone(),
             Self::CreateBranch { at, name, checkout, .. } => {
                 Operation::CreateBranch { name: valid(name)?, at: *at, checkout: *checkout }
             }
@@ -302,7 +326,7 @@ impl Dialog {
                 include_untracked: *include_untracked,
                 keep_index: *keep_index,
             },
-            Self::Pull { rebase } => Operation::Pull { rebase: *rebase },
+            Self::Pull { rebase } => Operation::Pull { rebase: *rebase, stash: false },
             Self::Push { remote, branch, set_upstream, force, tags } => {
                 if remote.is_empty() {
                     return None;
@@ -315,7 +339,7 @@ impl Dialog {
                     tags: *tags,
                 }
             }
-            Self::Merge { target, style } => Operation::Merge { target: target.clone(), style: *style },
+            Self::Merge { target, style } => Operation::Merge { target: target.clone(), style: *style, stash: false },
             Self::FlowFinish { kind, name, style } => Operation::FlowFinish { kind: *kind, name: name.clone(), style: *style },
             Self::Reset { target, mode } => Operation::Reset { target: *target, mode: *mode },
             Self::Rebase(editor) => editor.operation().ok()?,

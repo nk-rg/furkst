@@ -30,7 +30,9 @@ Requires the latest stable Rust (edition 2024, `rust-version = 1.99`) and `git` 
 - **Branches and remotes**: checkout by double-click, create, rename, delete (the local branch, its remote branch
   or both), track upstreams, fetch, pull (merge or rebase), push with force-with-lease, tags, remotes, background
   auto-fetch, drag a branch onto the current one to merge or rebase.
-- **Merging**: fast-forward, merge commit, squash and merge, rebase and merge; a three-way conflict resolver;
+- **Merging**: fast-forward, merge commit, squash and merge, rebase and merge; stash and merge (or pull) when
+  uncommitted changes are in the way, putting them back afterwards; a Conflicts window that resolves conflict by
+  conflict (accept current, incoming or both, single lines, or typed by hand) or in an external merge tool;
   cherry-pick, revert, reset; continue or abort anything in progress.
 - **Interactive rebase**: reorder, pick, reword, squash, fixup and drop, from any commit or the root, keeping
   uncommitted changes aside.
