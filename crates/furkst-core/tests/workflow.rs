@@ -233,11 +233,13 @@ fn file_history_matches_git_log() {
     assert_eq!(ours, git);
     assert_eq!(ours.len(), 6, "add, two main changes, side, merge side, late");
 
-    // Each version shows as added (the first), then modified.
+    // Each version shows as added (the first, which has no parents), then modified. The commits all share one
+    // timestamp on a fast machine, so where the first one is listed isn't fixed.
     let versions = t.repo.history(&query).unwrap();
     let kind = |commit: &furkst_core::CommitInfo| t.repo.file_change_at(commit.id, "f.txt").unwrap().kind;
-    assert_eq!(kind(versions.last().unwrap()), ChangeKind::Added);
-    assert!(versions[..versions.len() - 1].iter().all(|c| kind(c) == ChangeKind::Modified));
+    let (first, later): (Vec<_>, Vec<_>) = versions.iter().partition(|c| c.parents.is_empty());
+    assert_eq!(first.iter().map(|c| kind(c)).collect::<Vec<_>>(), [ChangeKind::Added]);
+    assert!(later.iter().all(|c| kind(c) == ChangeKind::Modified));
 }
 
 #[test]
