@@ -499,7 +499,8 @@ fn resolve_merge_conflict_with_mixed_choices() {
     assert_eq!(conflict_count(&segments), 2);
     assert!(matches!(segments[0], Segment::Common(_)));
 
-    let content = assemble(&segments, &[Some(Resolution::Theirs), Some(Resolution::OursThenTheirs)]);
+    let regions: Vec<_> = segments.iter().filter_map(|s| if let Segment::Conflict(r) = s { Some(r) } else { None }).collect();
+    let content = assemble(&segments, &[Some(regions[0].resolved(Resolution::Theirs)), Some(regions[1].resolved(Resolution::OursThenTheirs))]);
     t.run(Operation::ResolveMerged { change, content });
 
     let expected = base.replace("line 2\n", "topic 2\n").replace("line 11\n", "main 11\ntopic 11\n");
@@ -508,6 +509,65 @@ fn resolve_merge_conflict_with_mixed_choices() {
     assert!(!status.has_conflicts());
     assert!(status.unstaged.is_empty(), "{:?}", status.unstaged);
     assert!(status.staged.iter().any(|c| c.path == "a.txt"));
+}
+
+/// A repository stopped merging `topic`, which changed both files, into `main`, which deleted them.
+fn modify_delete_conflict(name: &str) -> TempRepo {
+    let t = TempRepo::new(name);
+    t.write("gone.txt", "base\n");
+    t.write("kept.txt", "base\n");
+    t.git(&["add", "."]);
+    t.git(&["commit", "-m", "base"]);
+    t.git(&["checkout", "-b", "topic"]);
+    t.write("gone.txt", "topic\n");
+    t.write("kept.txt", "topic\n");
+    t.git(&["commit", "-am", "topic"]);
+    t.git(&["checkout", "-"]);
+    t.git(&["rm", "-q", "gone.txt", "kept.txt"]);
+    t.git(&["commit", "-m", "delete"]);
+    assert!(t.repo.cli().run(&["merge", "topic"]).is_err());
+    t
+}
+
+#[test]
+fn resolve_a_file_deleted_on_one_side() {
+    let t = modify_delete_conflict("resolve-deleted");
+    let sides = t.repo.conflict_sides("gone.txt").unwrap();
+    assert!(!sides.ours && sides.theirs, "{sides:?}");
+    let conflicted: Vec<_> = t.repo.status().unwrap().conflicted().cloned().collect();
+    assert_eq!(conflicted.len(), 2);
+
+    for change in conflicted {
+        // Our side deleted gone.txt; kept.txt takes their changed version.
+        let ours = change.path == "gone.txt";
+        t.run(Operation::ResolveConflict { change, ours });
+    }
+    assert!(!t.dir.join("gone.txt").exists());
+    assert_eq!(t.read("kept.txt"), "topic\n");
+    assert!(!t.repo.status().unwrap().has_conflicts());
+}
+
+#[test]
+fn resolve_in_a_merge_tool() {
+    let t = TempRepo::new("merge-tool");
+    t.write("a.txt", "base\n");
+    t.git(&["add", "."]);
+    t.git(&["commit", "-m", "base"]);
+    t.git(&["checkout", "-b", "topic"]);
+    t.write("a.txt", "topic\n");
+    t.git(&["commit", "-am", "topic"]);
+    t.git(&["checkout", "-"]);
+    t.write("a.txt", "main\n");
+    t.git(&["commit", "-am", "main"]);
+    assert!(t.repo.cli().run(&["merge", "topic"]).is_err());
+
+    // A "tool" that takes their version, as a person clicking through one might.
+    let command = Some(r#"cp "$REMOTE" "$MERGED""#.to_owned());
+    t.run(Operation::MergeTool { path: "a.txt".into(), command });
+    assert_eq!(t.read("a.txt"), "topic\n");
+    let status = t.repo.status().unwrap();
+    assert!(!status.has_conflicts());
+    assert!(!t.dir.join("a.txt.orig").exists(), "no backup left behind");
 }
 
 #[test]

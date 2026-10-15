@@ -555,12 +555,7 @@ impl RowPainter {
         x += self.char_width * 2.0;
         let text = highlight::display_text(&line.text);
         let mut job = egui::text::LayoutJob::default();
-        let mut start = 0;
-        for &(end, color) in spans.into_iter().flatten() {
-            job.append(&text[start..end], 0.0, egui::TextFormat::simple(self.font.clone(), color));
-            start = end;
-        }
-        job.append(&text[start..], 0.0, egui::TextFormat::simple(self.font.clone(), self.text));
+        highlight::append(&mut job, &text, spans, &self.font, self.text);
         let code = Rect::from_min_max(pos2(x, rect.top()), rect.max);
         let layout = egui::Layout::left_to_right(egui::Align::Center);
         ui.scope_builder(egui::UiBuilder::new().max_rect(code).layout(layout), |ui| {

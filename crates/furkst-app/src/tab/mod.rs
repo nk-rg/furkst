@@ -148,6 +148,8 @@ enum Msg {
 struct LogEntry {
     description: String,
     output: Loaded<String>,
+    /// Whether it failed by stopping on conflicts, which is no error but the next step.
+    on_conflicts: bool,
 }
 
 pub struct RepoTab {
@@ -314,7 +316,7 @@ impl RepoTab {
         }
         tools::show(ui.ctx(), &mut self.tools, self.refs.as_ref(), settings, &mut actions);
         self.quick_launch(ui.ctx(), settings, &mut actions);
-        self.conflicts_window(ui.ctx(), &mut actions);
+        self.conflicts_window(ui.ctx(), settings, &mut actions);
         self.error_window(ui.ctx());
         self.log_window(ui.ctx());
 
@@ -540,7 +542,7 @@ impl RepoTab {
     }
 
     /// The prompt after an operation stopped on conflicts, and the Conflicts window while it is open.
-    fn conflicts_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+    fn conflicts_window(&mut self, ctx: &egui::Context, settings: &Settings, actions: &mut Vec<Action>) {
         if let Some(stopped) = &self.conflict_prompt
             && resolver::prompt(ctx, stopped, actions)
         {
@@ -549,7 +551,8 @@ impl RepoTab {
         let name = self.title();
         let Some(window) = &mut self.conflicts else { return };
         let id = egui::ViewportId::from_hash_of(("conflicts", self.repo.workdir()));
-        if resolver::show(ctx, window, &self.status, &name, id, actions) {
+        let font = egui::FontId::monospace(settings.diff_font_size);
+        if resolver::show(ctx, window, &self.status, &name, id, &font, actions) {
             self.conflicts = None;
         }
     }
@@ -763,6 +766,7 @@ impl RepoTab {
                     if is_fetch && result.is_ok() {
                         self.auto_fetch.succeeded(std::time::Instant::now());
                     }
+                    let on_conflicts = stopped.is_some();
                     match (&result, stopped) {
                         // The Conflicts window, when open, takes the new conflicts in (the next commit of a rebase).
                         (Err(_), Some(_)) if self.conflicts.is_some() => {}
@@ -779,7 +783,7 @@ impl RepoTab {
                             }
                         }
                     }
-                    self.log.push(LogEntry { description, output: result });
+                    self.log.push(LogEntry { description, output: result, on_conflicts });
                     if changes_refs {
                         self.refresh();
                     } else {
@@ -788,7 +792,7 @@ impl RepoTab {
                 }
                 Msg::AutoFetch(result) => {
                     let succeeded = result.is_ok();
-                    self.log.push(LogEntry { description: "Auto-fetch".into(), output: result });
+                    self.log.push(LogEntry { description: "Auto-fetch".into(), output: result, on_conflicts: false });
                     if succeeded {
                         self.auto_fetch.succeeded(std::time::Instant::now());
                         self.refresh();
@@ -825,10 +829,13 @@ impl RepoTab {
             }
             match (self.progress.current(), self.log.last()) {
                 (Some(line), _) => ui.label(RichText::new(line).weak()),
-                (None, Some(LogEntry { description, output: Ok(_) })) => {
+                (None, Some(LogEntry { description, on_conflicts: true, .. })) => {
+                    ui.label(RichText::new(format!("{description}: stopped on conflicts")).color(ui.visuals().warn_fg_color))
+                }
+                (None, Some(LogEntry { description, output: Ok(_), .. })) => {
                     ui.label(RichText::new(format!("✔ {description}")).weak())
                 }
-                (None, Some(LogEntry { description, output: Err(_) })) => {
+                (None, Some(LogEntry { description, output: Err(_), .. })) => {
                     ui.label(RichText::new(format!("✖ {description}")).color(ui.visuals().error_fg_color))
                 }
                 (None, None) => ui.label(RichText::new(self.repo.workdir().display().to_string()).weak()),

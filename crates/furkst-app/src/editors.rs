@@ -106,6 +106,20 @@ impl Editor {
         }
         command.spawn().map(drop)
     }
+
+    /// The shell command `git mergetool` runs to resolve a conflicted file in this editor's merge view, for editors
+    /// that have one (VS Code and its relatives). It waits until the merge view closes.
+    pub fn merge_command(&self) -> Option<String> {
+        if self.line != LineArgument::Goto {
+            return None;
+        }
+        // Git runs it with its own shell, which takes the shell script these editors ship beside their `.cmd`
+        // launcher on Windows.
+        let script = self.program.with_extension("");
+        let program = if script != self.program && script.is_file() { script } else { self.program.clone() };
+        let program = program.display().to_string().replace('\\', "/");
+        Some(format!(r#""{program}" --wait --merge "$REMOTE" "$LOCAL" "$BASE" "$MERGED""#))
+    }
 }
 
 impl LineArgument {
@@ -216,6 +230,17 @@ mod tests {
         assert_eq!(LineArgument::Suffix.arguments(file, 7), ["src/main.rs:7"]);
         assert_eq!(LineArgument::Flag.arguments(file, 7), ["--line", "7", "src/main.rs"]);
         assert_eq!(LineArgument::Notepad.arguments(file, 7), ["-n7", "src/main.rs"]);
+    }
+
+    #[test]
+    fn merges_in_editors_with_a_merge_view() {
+        let editor = |program: &str, line| Editor { name: String::new(), program: PathBuf::from(program), line };
+        let code = editor(r"C:\Tools\Code\bin\code.cmd", LineArgument::Goto);
+        assert_eq!(
+            code.merge_command().as_deref(),
+            Some(r#""C:/Tools/Code/bin/code.cmd" --wait --merge "$REMOTE" "$LOCAL" "$BASE" "$MERGED""#)
+        );
+        assert_eq!(editor("/usr/bin/subl", LineArgument::Suffix).merge_command(), None);
     }
 
     #[test]

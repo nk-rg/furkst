@@ -37,7 +37,7 @@ pub use graph::{GraphLine, GraphRow, Half, MAX_LANES, layout as layout_graph};
 pub use history::{CommitSearch, HistoryQuery, SearchHit};
 pub use lfs::LfsPointer;
 pub use merging::MergeStyle;
-pub use merge::{ConflictRegion, Resolution, Segment, assemble, conflict_count, parse_conflicts};
+pub use merge::{ConflictRegion, ConflictSides, Resolution, Segment, assemble, conflict_count, lines, parse_conflicts};
 pub use model::*;
 pub use operation::{Operation, ResetMode};
 pub use rebase::{RebaseAction, RebaseStep, validate_rebase};

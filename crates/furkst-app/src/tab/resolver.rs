@@ -2,19 +2,25 @@
 //! listing the conflicted files and resolving one at a time, conflict by conflict, in the words VS Code uses ("current"
 //! for the checked-out side, "incoming" for the side being brought in).
 
-use egui::{RichText, Ui};
+use egui::{Color32, FontId, RichText, Ui};
 use furkst_core::{
-    ConflictRegion, FileChange, InProgress, Operation, Repo, Resolution, Segment, WorkingStatus, assemble, conflict_count,
+    ConflictRegion, ConflictSides, FileChange, InProgress, Operation, Repo, Resolution, Segment, WorkingStatus, assemble,
+    conflict_count, lines,
 };
 
 use super::Action;
+use super::highlight::{self, Spans};
 use crate::theme::DiffColors;
 use crate::widgets;
 
-/// Taking one side for a whole file: label, tooltip and whether it is the current side.
+/// Taking one side's version of a whole file: label, tooltip and whether it is the current side.
 pub const WHOLE_FILE: [(&str, &str, bool); 2] = [
-    ("Accept all current", "Keep the checked-out version of the whole file", true),
-    ("Accept all incoming", "Take the version being brought in, for the whole file", false),
+    (
+        "Use the current version",
+        "The whole file as the checked-out side has it (deleted, if that side deleted it), without the incoming changes",
+        true,
+    ),
+    ("Use the incoming version", "The whole file as the side being brought in has it (deleted, if that side deleted it)", false),
 ];
 
 /// Resolves `change` by taking one side of it entirely.
@@ -136,6 +142,7 @@ pub fn show(
     status: &WorkingStatus,
     repo_name: &str,
     id: egui::ViewportId,
+    font: &FontId,
     actions: &mut Vec<Action>,
 ) -> bool {
     let conflicted: Vec<&FileChange> = status.conflicted().collect();
@@ -171,7 +178,7 @@ pub fn show(
         widgets::left_panel(ui, "conflicts_files", 300.0).show(ui, |ui| file_list(ui, window, &pending, actions));
         egui::CentralPanel::default().show(ui, |ui| match &mut window.current {
             Some(current) => {
-                if let Some(action) = current.show(ui) {
+                if let Some(action) = current.show(ui, font) {
                     actions.push(action);
                     window.finish_current();
                 }
@@ -265,51 +272,199 @@ fn all_resolved(ui: &mut Ui, operation: Option<InProgress>, actions: &mut Vec<Ac
     });
 }
 
-/// One file's conflicts and the choice made for each.
+/// One file's conflicts and what each turns into.
 struct FileResolver {
     change: FileChange,
-    /// The parsed file, or why it can't be resolved conflict by conflict.
-    content: Result<Vec<Segment>, String>,
-    /// One entry per conflict, in file order.
-    choices: Vec<Option<Resolution>>,
+    /// Its conflicts, or why it has none to choose between.
+    content: Result<Conflicts, Unparsed>,
+    /// The merge tool git is set up with (`merge.tool`), if any.
+    merge_tool: Option<String>,
+    /// The merge tool the file was opened in, while it may still be open.
+    opened_in: Option<String>,
+}
+
+/// A conflicted file without conflict markers: deleted on one side, or binary.
+struct Unparsed {
+    message: String,
+    sides: Option<ConflictSides>,
+}
+
+struct Conflicts {
+    segments: Vec<Segment>,
+    conflicts: Vec<Conflict>,
+    /// Syntax colors, for the dark theme or not: three blocks per conflict, its current, base and incoming lines.
+    highlights: Option<(bool, Option<Vec<Vec<Spans>>>)>,
+    /// The conflict the arrows went to last, and whether to scroll to it.
+    at: usize,
+    scroll: bool,
+}
+
+struct Conflict {
+    region: ConflictRegion,
+    /// Which lines of the current and the incoming side are kept.
+    ours: Vec<bool>,
+    theirs: Vec<bool>,
+    theirs_first: bool,
+    /// What the conflict turns into; `None` until something is chosen or typed.
+    result: Option<String>,
+    /// The line number the current, base and incoming text start at, in their side's version of the file.
+    starts: [usize; 3],
+}
+
+impl Conflict {
+    fn choose(&mut self, resolution: Resolution) {
+        (self.ours, self.theirs) = resolution.picks(&self.region);
+        self.theirs_first = resolution == Resolution::TheirsThenOurs;
+        self.result = Some(self.region.resolved(resolution));
+    }
+
+    /// Keeps or drops one line of the current side (`ours`) or the incoming one.
+    fn toggle(&mut self, ours: bool, line: usize) {
+        let picks = if ours { &mut self.ours } else { &mut self.theirs };
+        picks[line] = !picks[line];
+        self.result = Some(self.region.pick(&self.ours, &self.theirs, self.theirs_first));
+    }
+
+    fn reset(&mut self) {
+        self.ours.fill(false);
+        self.theirs.fill(false);
+        self.result = None;
+    }
+
+    /// The choice the result matches, if it matches one.
+    fn chosen(&self) -> Option<Resolution> {
+        let result = self.result.as_ref()?;
+        Resolution::ALL.into_iter().find(|resolution| self.region.resolved(*resolution) == *result)
+    }
+}
+
+impl Conflicts {
+    fn new(segments: Vec<Segment>) -> Self {
+        let mut conflicts = Vec::new();
+        let mut next = [1, 1, 1];
+        for segment in &segments {
+            match segment {
+                Segment::Common(text) => next = next.map(|n| n + lines(text).count()),
+                Segment::Conflict(region) => {
+                    let base = region.base.as_deref().unwrap_or_default();
+                    let sizes = [region.ours.as_str(), base, region.theirs.as_str()].map(|text| lines(text).count());
+                    conflicts.push(Conflict {
+                        region: region.clone(),
+                        ours: vec![false; sizes[0]],
+                        theirs: vec![false; sizes[2]],
+                        theirs_first: false,
+                        result: None,
+                        starts: next,
+                    });
+                    next = [0, 1, 2].map(|side| next[side] + sizes[side]);
+                }
+            }
+        }
+        Self { segments, conflicts, highlights: None, at: 0, scroll: false }
+    }
+
+    fn results(&self) -> Vec<Option<String>> {
+        self.conflicts.iter().map(|c| c.result.clone()).collect()
+    }
+
+    /// Syntax colors of every conflict's sides, worked out again when the theme changes.
+    fn highlights(&mut self, path: &str, dark: bool) -> Option<&Vec<Vec<Spans>>> {
+        if self.highlights.as_ref().is_none_or(|(was_dark, _)| *was_dark != dark) {
+            let shown: Vec<Vec<String>> = self
+                .conflicts
+                .iter()
+                .flat_map(|c| [c.region.ours.as_str(), c.region.base.as_deref().unwrap_or_default(), c.region.theirs.as_str()])
+                .map(|text| lines(text).map(shown_line).collect())
+                .collect();
+            let blocks: Vec<Vec<&str>> = shown.iter().map(|lines| lines.iter().map(String::as_str).collect()).collect();
+            self.highlights = Some((dark, highlight::highlight_blocks(path, &blocks, dark)));
+        }
+        self.highlights.as_ref().and_then(|(_, spans)| spans.as_ref())
+    }
+}
+
+/// A line as drawn: without its line break, tabs as spaces.
+fn shown_line(line: &str) -> String {
+    highlight::display_text(line.trim_end_matches(['\n', '\r'])).into_owned()
+}
+
+/// How code looks: the diff font, colors, and the file it is from (for syntax colors).
+struct Code<'a> {
+    font: FontId,
+    path: &'a str,
+    text: Color32,
+    weak: Color32,
+    dark: bool,
 }
 
 impl FileResolver {
     fn open(repo: &Repo, change: FileChange) -> Self {
         let content = match repo.conflict_segments(&change.path) {
-            Ok(segments) if conflict_count(&segments) == 0 => Err("This file has no conflict markers to choose between, \
-                 for example because it was deleted on one side, or it is binary."
-                .to_owned()),
-            Ok(segments) => Ok(segments),
-            Err(err) => Err(format!("This file can't be resolved conflict by conflict: {err}.")),
+            Ok(segments) if conflict_count(&segments) > 0 => Ok(Conflicts::new(segments)),
+            parsed => {
+                let sides = repo.conflict_sides(&change.path).ok();
+                let message = match (sides, parsed) {
+                    (Some(ConflictSides { ours: false, .. }), _) => {
+                        "The current side deleted this file, and the incoming side changed it.".to_owned()
+                    }
+                    (Some(ConflictSides { theirs: false, .. }), _) => {
+                        "The current side changed this file, and the incoming side deleted it.".to_owned()
+                    }
+                    (_, Err(err)) => format!("This file can't be resolved conflict by conflict: {err}."),
+                    (_, Ok(_)) => "This file has no conflict markers to choose between.".to_owned(),
+                };
+                Err(Unparsed { message, sides })
+            }
         };
-        let choices = vec![None; content.as_ref().map_or(0, |s| conflict_count(s))];
-        Self { change, content, choices }
+        Self { change, content, merge_tool: repo.configured_merge_tool(), opened_in: None }
     }
 
     /// Returns the action that resolves the file, once one of its buttons says so.
-    fn show(&mut self, ui: &mut Ui) -> Option<Action> {
+    fn show(&mut self, ui: &mut Ui, font: &FontId) -> Option<Action> {
         let mut outcome = None;
+        let code = Code {
+            font: font.clone(),
+            path: &self.change.path,
+            text: ui.visuals().strong_text_color(),
+            weak: ui.visuals().weak_text_color(),
+            dark: ui.visuals().dark_mode,
+        };
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            widgets::file_label(ui, &self.change, ui.visuals().strong_text_color(), true);
+            widgets::file_label(ui, &self.change, code.text, true);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for (label, tooltip, ours) in WHOLE_FILE.into_iter().rev() {
-                    if ui.button(label).on_hover_text(tooltip).clicked() {
-                        outcome = Some(take_side(&self.change, ours));
+                if let Some(action) = merge_tool_menu(ui, &self.change.path, self.merge_tool.as_deref(), &mut self.opened_in) {
+                    outcome = Some(action);
+                }
+                match &mut self.content {
+                    Ok(conflicts) => {
+                        for (label, resolution) in [("Accept all incoming", Resolution::Theirs), ("Accept all current", Resolution::Ours)] {
+                            if ui.button(label).on_hover_text("In every conflict of this file").clicked() {
+                                conflicts.conflicts.iter_mut().for_each(|c| c.choose(resolution));
+                            }
+                        }
+                    }
+                    Err(unparsed) => {
+                        for (label, ours) in side_choices(unparsed.sides).into_iter().rev() {
+                            if ui.button(label).clicked() {
+                                outcome = Some(take_side(&self.change, ours));
+                            }
+                        }
                     }
                 }
             });
         });
+        if let Some(tool) = &self.opened_in {
+            ui.label(RichText::new(format!("Opened in {tool}: save the result there and close it, and Furkst takes it from there.")).weak());
+        }
         ui.separator();
-        match &self.content {
-            Err(message) => {
-                widgets::placeholder(ui, &format!("{message}\nKeep one side with the buttons above."));
-            }
-            Ok(segments) => {
-                if body(ui, segments, &mut self.choices) {
+        match &mut self.content {
+            Err(unparsed) => widgets::placeholder(ui, &format!("{}\nChoose which version to keep with the buttons above.", unparsed.message)),
+            Ok(conflicts) => {
+                if body(ui, conflicts, &code) {
                     outcome = Some(Action::Run(Operation::ResolveMerged {
                         change: self.change.clone(),
-                        content: assemble(segments, &self.choices),
+                        content: assemble(&conflicts.segments, &conflicts.results()),
                     }));
                 }
             }
@@ -318,75 +473,204 @@ impl FileResolver {
     }
 }
 
-/// Every conflict with its choices, the text around them folded away. Returns whether "Save and mark resolved" was
-/// clicked.
-fn body(ui: &mut Ui, segments: &[Segment], choices: &mut [Option<Resolution>]) -> bool {
+/// The versions to choose between for a file without conflict markers, as (label, whether it is the current one).
+fn side_choices(sides: Option<ConflictSides>) -> [(&'static str, bool); 2] {
+    match sides {
+        Some(ConflictSides { ours: false, .. }) => [("Keep it deleted", true), ("Keep the incoming file", false)],
+        Some(ConflictSides { theirs: false, .. }) => [("Keep the current file", true), ("Delete it", false)],
+        _ => WHOLE_FILE.map(|(label, _, ours)| (label, ours)),
+    }
+}
+
+/// "Open in merge tool": the one git is set up with, and the installed editors with a merge view.
+fn merge_tool_menu(ui: &mut Ui, path: &str, configured: Option<&str>, opened_in: &mut Option<String>) -> Option<Action> {
+    let mut action = None;
+    ui.menu_button("Open in merge tool", |ui| {
+        let mut open = |ui: &mut Ui, name: String, command: Option<String>| {
+            *opened_in = Some(name);
+            action = Some(Action::Run(Operation::MergeTool { path: path.to_owned(), command }));
+            ui.close();
+        };
+        if let Some(tool) = configured
+            && ui.button(format!("{tool} (git mergetool)")).clicked()
+        {
+            open(ui, tool.to_owned(), None);
+        }
+        let editors: Vec<_> = crate::editors::installed().iter().filter_map(|e| Some((e, e.merge_command()?))).collect();
+        for (editor, command) in &editors {
+            if ui.button(&editor.name).clicked() {
+                open(ui, editor.name.clone(), Some(command.clone()));
+            }
+        }
+        if configured.is_none() && editors.is_empty() {
+            ui.label(RichText::new("No merge tool found: set one up with git config merge.tool, or install VS Code.").weak());
+        }
+    });
+    action
+}
+
+/// Every conflict, the text around them folded away, with the arrows between them. Returns whether "Save and mark
+/// resolved" was clicked.
+fn body(ui: &mut Ui, conflicts: &mut Conflicts, code: &Code) -> bool {
     let colors = DiffColors::of(ui.visuals());
+    let count = conflicts.conflicts.len();
+    let chosen = conflicts.conflicts.iter().filter(|c| c.result.is_some()).count();
+    ui.horizontal(|ui| {
+        let previous = ui.add_enabled(conflicts.at > 0, egui::Button::new("⬆")).on_hover_text("Previous conflict");
+        let next = ui.add_enabled(conflicts.at + 1 < count, egui::Button::new("⬇")).on_hover_text("Next conflict");
+        if previous.clicked() {
+            conflicts.at -= 1;
+            conflicts.scroll = true;
+        }
+        if next.clicked() {
+            conflicts.at += 1;
+            conflicts.scroll = true;
+        }
+        ui.label(format!("Conflict {} of {count}", conflicts.at + 1));
+        ui.label(RichText::new(format!("{chosen} of {count} chosen")).weak());
+    });
+    let spans = conflicts.highlights(code.path, code.dark).cloned();
     let height = (ui.available_height() - 90.0).max(120.0);
     egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| {
         let mut index = 0;
-        for segment in segments {
+        for segment in &conflicts.segments {
             match segment {
                 Segment::Common(text) => {
-                    let lines = text.lines().count();
-                    egui::CollapsingHeader::new(RichText::new(format!("{lines} unchanged lines")).weak())
+                    let lines = lines(text).count();
+                    egui::CollapsingHeader::new(RichText::new(format!("{lines} unchanged line{}", if lines == 1 { "" } else { "s" })).weak())
                         .id_salt(("common", index, lines))
-                        .show(ui, |ui| ui.label(RichText::new(text).monospace()));
+                        .show(ui, |ui| ui.label(RichText::new(text).font(code.font.clone())));
                 }
-                Segment::Conflict(region) => {
-                    region_ui(ui, region, &mut choices[index], index, &colors);
+                Segment::Conflict(_) => {
+                    let blocks = spans.as_ref().map(|spans| &spans[index * 3..index * 3 + 3]);
+                    let rect = conflict_ui(ui, &mut conflicts.conflicts[index], index, blocks, &colors, code);
+                    if conflicts.scroll && conflicts.at == index {
+                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                        conflicts.scroll = false;
+                    }
                     index += 1;
                 }
             }
         }
     });
     ui.separator();
-    let resolved = choices.iter().flatten().count();
-    egui::CollapsingHeader::new("Preview of the result").show(ui, |ui| {
+    egui::CollapsingHeader::new("Preview of the whole file").show(ui, |ui| {
         egui::ScrollArea::both().id_salt("preview").max_height(160.0).show(ui, |ui| {
-            ui.label(RichText::new(assemble(segments, choices)).monospace());
+            ui.label(RichText::new(assemble(&conflicts.segments, &conflicts.results())).font(code.font.clone()));
         });
     });
-    ui.horizontal(|ui| {
-        ui.label(format!("{resolved} of {} conflicts chosen", choices.len()));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_enabled(resolved == choices.len(), egui::Button::new(RichText::new("Save and mark resolved").strong()))
-                .on_disabled_hover_text("Choose what to keep in every conflict first")
-                .clicked()
-        })
-        .inner
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add_enabled(chosen == count, egui::Button::new(RichText::new("Save and mark resolved").strong()))
+            .on_disabled_hover_text("Choose what to keep in every conflict first")
+            .clicked()
     })
     .inner
 }
 
-fn region_ui(ui: &mut Ui, region: &ConflictRegion, choice: &mut Option<Resolution>, index: usize, colors: &DiffColors) {
+/// One conflict: the choices, its sides line by line (each line of the current and incoming side can be kept or
+/// dropped), and the result, which can also be typed. Returns where it was drawn.
+fn conflict_ui(ui: &mut Ui, conflict: &mut Conflict, index: usize, spans: Option<&[Vec<Spans>]>, colors: &DiffColors, code: &Code) -> egui::Rect {
     ui.group(|ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("Conflict {}", index + 1)).strong());
             ui.add_space(8.0);
+            let chosen = conflict.chosen();
             for resolution in Resolution::ALL {
-                if ui.selectable_label(*choice == Some(resolution), resolution.label()).clicked() {
-                    *choice = Some(resolution);
+                if ui.selectable_label(chosen == Some(resolution), resolution.label()).clicked() {
+                    conflict.choose(resolution);
                 }
+            }
+            if conflict.result.is_some() && ui.button("Reset").on_hover_text("Start this conflict over").clicked() {
+                conflict.reset();
             }
         });
         // Green for the checked-out side and blue for the incoming one, as in VS Code.
-        let sides = [
-            Some(("Current", &region.ours_label, &region.ours, colors.added, "The checked-out version (HEAD)")),
-            region.base.as_ref().map(|base| ("Base", &region.base_label, base, ui.visuals().faint_bg_color, "What both sides started from")),
-            Some(("Incoming", &region.theirs_label, &region.theirs, colors.hunk, "The version being brought in")),
-        ];
-        let sides: Vec<_> = sides.into_iter().flatten().collect();
+        let region = &conflict.region;
+        let mut sides = vec![(0, "Current", &region.ours_label, region.ours.as_str(), colors.added, "The checked-out version (HEAD)")];
+        if let Some(base) = &region.base {
+            sides.push((1, "Base", &region.base_label, base.as_str(), ui.visuals().faint_bg_color, "What both sides started from"));
+        }
+        sides.push((2, "Incoming", &region.theirs_label, region.theirs.as_str(), colors.hunk, "The version being brought in"));
+        let mut toggled = None;
         ui.columns(sides.len(), |columns| {
-            for (ui, (title, label, text, fill, meaning)) in columns.iter_mut().zip(sides.iter()) {
-                let heading = if label.is_empty() { (*title).to_owned() } else { format!("{title} — {label}") };
-                ui.label(widgets::section_title(&heading)).on_hover_text(*meaning);
-                egui::Frame::new().fill(*fill).inner_margin(4.0).show(ui, |ui| {
+            for (ui, (side, title, label, text, fill, meaning)) in columns.iter_mut().zip(sides) {
+                let heading = if label.is_empty() { title.to_owned() } else { format!("{title} — {label}") };
+                ui.label(widgets::section_title(&heading)).on_hover_text(meaning);
+                let picks = match side {
+                    0 => Some(&conflict.ours),
+                    2 => Some(&conflict.theirs),
+                    _ => None,
+                };
+                egui::Frame::new().fill(fill).inner_margin(4.0).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    let text = if text.is_empty() { RichText::new("(nothing)").italics().weak() } else { RichText::new(text.as_str()).monospace() };
-                    ui.label(text);
+                    let spans = spans.map(|blocks| &blocks[side]);
+                    if let Some(line) = side_lines(ui, (index, side), text, conflict.starts[side], picks, spans, code) {
+                        toggled = Some((side == 0, line));
+                    }
                 });
             }
         });
+        if let Some((ours, line)) = toggled {
+            conflict.toggle(ours, line);
+        }
+        ui.add_space(4.0);
+        ui.label(widgets::section_title("Result")).on_hover_text("What goes into the file; type to change it");
+        let mut text = conflict.result.clone().unwrap_or_default();
+        let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+            let mut job = highlight::code_job(code.path, buffer.as_str(), &code.font, code.text, code.dark);
+            job.wrap.max_width = wrap_width;
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
+        let edit = egui::TextEdit::multiline(&mut text)
+            .font(code.font.clone())
+            .hint_text("Choose above, tick the lines to keep, or type the result here")
+            .desired_width(f32::INFINITY)
+            .desired_rows(1)
+            .layouter(&mut layouter);
+        if ui.add(edit).changed() {
+            conflict.result = Some(text);
+        }
+    })
+    .response
+    .rect
+}
+
+/// The lines of one side, numbered, in syntax colors; with `picks`, each with a box to keep it. Returns the line whose
+/// box (or text) was clicked.
+fn side_lines(
+    ui: &mut Ui,
+    id: (usize, usize),
+    text: &str,
+    start: usize,
+    picks: Option<&Vec<bool>>,
+    spans: Option<&Vec<Spans>>,
+    code: &Code,
+) -> Option<usize> {
+    if text.is_empty() {
+        ui.label(RichText::new("(nothing)").italics().weak());
+        return None;
+    }
+    let mut clicked = None;
+    egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+        for (index, line) in lines(text).enumerate() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if let Some(picks) = picks {
+                    let mut keep = picks[index];
+                    if ui.checkbox(&mut keep, "").on_hover_text("Keep this line").changed() {
+                        clicked = Some(index);
+                    }
+                }
+                ui.label(RichText::new(format!("{:>4}", start + index)).font(code.font.clone()).color(code.weak));
+                let mut job = egui::text::LayoutJob::default();
+                highlight::append(&mut job, &shown_line(line), spans.and_then(|s| s.get(index)), &code.font, code.text);
+                let sense = if picks.is_some() { egui::Sense::click() } else { egui::Sense::hover() };
+                let label = ui.add(egui::Label::new(job).extend().selectable(false).sense(sense));
+                if picks.is_some() && label.clicked() {
+                    clicked = Some(index);
+                }
+            });
+        }
     });
+    clicked
 }

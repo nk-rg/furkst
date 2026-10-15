@@ -40,6 +40,9 @@ pub enum Operation {
     ResolveConflict { change: FileChange, ours: bool },
     /// Replaces a conflicted file with the merged `content` (worktree form), then marks it resolved.
     ResolveMerged { change: FileChange, content: String },
+    /// Resolves conflicted `path` in an external merge tool (`git mergetool`): the configured one, or `command`, a
+    /// shell command using `$LOCAL`, `$REMOTE`, `$BASE` and `$MERGED`. Marked resolved once the tool saves the file.
+    MergeTool { path: String, command: Option<String> },
     /// Writes `path` as it was in `commit` to `destination`.
     SaveFileAt { commit: Oid, path: String, destination: PathBuf },
 
@@ -110,6 +113,7 @@ impl Operation {
                 format!("Resolve {} using the {} version", change.path, if *ours { "current" } else { "incoming" })
             }
             Self::ResolveMerged { change, .. } => format!("Resolve conflicts in {}", change.path),
+            Self::MergeTool { path, .. } => format!("Resolve {path} in a merge tool"),
             Self::SaveFileAt { path, destination, .. } => format!("Save {path} to {}", destination.display()),
             Self::CreateBranch { name, .. } => format!("Create branch {name}"),
             Self::RenameBranch { from, to } => format!("Rename branch {from} to {to}"),
@@ -135,8 +139,8 @@ impl Operation {
             Self::CherryPick { commit } => format!("Cherry-pick {}", short_id(commit)),
             Self::Revert { commit } => format!("Revert {}", short_id(commit)),
             Self::Reset { target, mode } => format!("Reset ({mode:?}) to {}", short_id(target)),
-            Self::Continue(op) => format!("Continue {}", op.label().to_lowercase()),
-            Self::Abort(op) => format!("Abort {}", op.label().to_lowercase()),
+            Self::Continue(op) => format!("Continue {}", op.name()),
+            Self::Abort(op) => format!("Abort {}", op.name()),
             Self::StashSave { .. } => "Stash changes".into(),
             Self::StashApply { index, pop: true } => format!("Pop stash@{{{index}}}"),
             Self::StashApply { index, pop: false } => format!("Apply stash@{{{index}}}"),
@@ -161,7 +165,7 @@ impl Operation {
     pub fn changes_refs(&self) -> bool {
         !matches!(
             self,
-            Self::Stage(_) | Self::Unstage(_) | Self::Discard(_) | Self::ApplySelection { .. } | Self::ResolveMerged { .. } | Self::SaveFileAt { .. }
+            Self::Stage(_) | Self::Unstage(_) | Self::Discard(_) | Self::ApplySelection { .. } | Self::ResolveMerged { .. } | Self::MergeTool { .. } | Self::SaveFileAt { .. }
                 | Self::LfsPull
                 | Self::LfsFetch
                 | Self::LfsTrack { .. }
@@ -209,9 +213,17 @@ impl Operation {
                 repo.apply_selection(action, &path, &selection, options).map(|()| String::new())
             }
             Self::Commit { message, amend } => repo.commit(&message, amend),
-            Self::ResolveConflict { change, ours } => {
-                git(&["checkout", if ours { "--ours" } else { "--theirs" }, "--", &change.path])?;
-                repo.stage(&[change]).map(|()| String::new())
+            Self::ResolveConflict { change, ours } => repo.take_side(&change, ours),
+            Self::MergeTool { path, command } => {
+                let tool = command.map(|command| format!("mergetool.furkst.cmd={command}"));
+                let mut args = vec!["-c", "mergetool.keepBackup=false"];
+                match &tool {
+                    // Without trusting its exit code, git checks whether the tool saved the file.
+                    Some(tool) => args.extend(["-c", tool, "-c", "mergetool.furkst.trustExitCode=false", "mergetool", "--tool=furkst"]),
+                    None => args.push("mergetool"),
+                }
+                args.extend(["--no-prompt", "--", &path]);
+                git(&args)
             }
             Self::ResolveMerged { change, content } => repo.resolve_with_content(&change, &content).map(|()| String::new()),
             Self::SaveFileAt { commit, path, destination } => {

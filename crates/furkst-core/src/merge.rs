@@ -1,7 +1,17 @@
 //! Parsing of conflict markers in a working tree file, and assembling the merged result from per-region choices.
 
+use gix::bstr::BStr;
+use gix::index::entry::Stage;
+
 use crate::error::{Error, Result};
 use crate::{FileChange, Repo};
+
+/// Which sides of a conflict still have the file; one without it deleted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConflictSides {
+    pub ours: bool,
+    pub theirs: bool,
+}
 
 /// One `<<<<<<<` … `>>>>>>>` block. Texts keep their line terminators.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,13 +55,50 @@ impl Resolution {
 impl ConflictRegion {
     /// The text this region contributes to the merged file under `resolution`.
     pub fn resolved(&self, resolution: Resolution) -> String {
-        match resolution {
-            Resolution::Ours => self.ours.clone(),
-            Resolution::Theirs => self.theirs.clone(),
-            Resolution::OursThenTheirs => format!("{}{}", self.ours, self.theirs),
-            Resolution::TheirsThenOurs => format!("{}{}", self.theirs, self.ours),
-        }
+        let (ours, theirs) = resolution.picks(self);
+        self.pick(&ours, &theirs, resolution == Resolution::TheirsThenOurs)
     }
+
+    /// The lines picked from each side, `ours[i]` saying whether the `i`-th line of ours is kept: ours' first, or
+    /// theirs' with `theirs_first`.
+    pub fn pick(&self, ours: &[bool], theirs: &[bool], theirs_first: bool) -> String {
+        let kept = |text: &str, keep: &[bool]| -> Vec<String> {
+            lines(text).zip(keep).filter(|(_, keep)| **keep).map(|(line, _)| line.to_owned()).collect()
+        };
+        let (ours, theirs) = (kept(&self.ours, ours), kept(&self.theirs, theirs));
+        let ordered = if theirs_first { [theirs, ours] } else { [ours, theirs] };
+        let mut text = String::new();
+        for line in ordered.iter().flatten() {
+            // A side ending the file can lack its last line break; a line after it must not run on.
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push_str(self.line_break());
+            }
+            text.push_str(line);
+        }
+        text
+    }
+
+    /// The line break the file uses.
+    fn line_break(&self) -> &'static str {
+        if self.ours.contains("\r\n") || self.theirs.contains("\r\n") { "\r\n" } else { "\n" }
+    }
+}
+
+impl Resolution {
+    /// Which lines of each side of `region` it keeps.
+    pub fn picks(self, region: &ConflictRegion) -> (Vec<bool>, Vec<bool>) {
+        let (keep_ours, keep_theirs) = match self {
+            Self::Ours => (true, false),
+            Self::Theirs => (false, true),
+            Self::OursThenTheirs | Self::TheirsThenOurs => (true, true),
+        };
+        (vec![keep_ours; lines(&region.ours).count()], vec![keep_theirs; lines(&region.theirs).count()])
+    }
+}
+
+/// The lines of `text`, each with its line break.
+pub fn lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split_inclusive('\n')
 }
 
 /// Number of conflict regions in `segments`.
@@ -134,15 +181,15 @@ pub fn parse_conflicts(text: &str) -> Result<Vec<Segment>> {
     Ok(segments)
 }
 
-/// Builds the merged text; `choices` has one entry per conflict region (in order). A region without a choice
+/// Builds the merged text; `results` has what each conflict region (in order) turned into. A region without one
 /// contributes nothing, which is only meant for previews.
-pub fn assemble(segments: &[Segment], choices: &[Option<Resolution>]) -> String {
-    let mut regions = choices.iter();
+pub fn assemble(segments: &[Segment], results: &[Option<String>]) -> String {
+    let mut regions = results.iter();
     segments
         .iter()
         .map(|segment| match segment {
             Segment::Common(text) => text.clone(),
-            Segment::Conflict(region) => regions.next().copied().flatten().map_or_else(String::new, |r| region.resolved(r)),
+            Segment::Conflict(_) => regions.next().cloned().flatten().unwrap_or_default(),
         })
         .collect()
 }
@@ -153,6 +200,34 @@ impl Repo {
         let bytes = std::fs::read(self.workdir().join(path))?;
         let text = String::from_utf8(bytes).map_err(|_| Error::msg("the file is binary or not valid UTF-8"))?;
         parse_conflicts(&text)
+    }
+
+    /// Which sides have a version of conflicted `path`: a side without one deleted the file.
+    pub fn conflict_sides(&self, path: &str) -> Result<ConflictSides> {
+        let index = self.gix().index_or_empty()?;
+        let has = |stage| index.entry_by_path_and_stage(BStr::new(path), stage).is_some();
+        Ok(ConflictSides { ours: has(Stage::Ours), theirs: has(Stage::Theirs) })
+    }
+
+    /// The merge tool `git mergetool` uses, if one is set up (`merge.tool`).
+    pub fn configured_merge_tool(&self) -> Option<String> {
+        let tool = self.gix().config_snapshot().string("merge.tool")?.to_string();
+        (!tool.trim().is_empty()).then_some(tool)
+    }
+
+    /// Resolves a conflicted file by keeping one side's version of it entirely, deleting it if that side deleted it.
+    pub(crate) fn take_side(&self, change: &FileChange, ours: bool) -> Result<String> {
+        let sides = self.conflict_sides(&change.path)?;
+        if if ours { sides.ours } else { sides.theirs } {
+            self.cli().run(&["checkout", if ours { "--ours" } else { "--theirs" }, "--", &change.path])?;
+        } else {
+            let file = self.workdir().join(&change.path);
+            if file.exists() {
+                std::fs::remove_file(file)?;
+            }
+        }
+        self.stage(std::slice::from_ref(change))?;
+        Ok(String::new())
     }
 
     /// Writes the resolved file as is (it is already in working tree form) and stages it, marking it resolved.
@@ -168,6 +243,52 @@ mod tests {
 
     fn region(segments: &[Segment], n: usize) -> &ConflictRegion {
         segments.iter().filter_map(|s| if let Segment::Conflict(r) = s { Some(r) } else { None }).nth(n).unwrap()
+    }
+
+    /// The merged text with a choice (or none) for each region.
+    fn with(segments: &[Segment], choices: &[Option<Resolution>]) -> String {
+        let results: Vec<Option<String>> =
+            choices.iter().enumerate().map(|(n, choice)| choice.map(|c| region(segments, n).resolved(c))).collect();
+        assemble(segments, &results)
+    }
+
+    #[test]
+    fn picks_single_lines_from_each_side() {
+        let s = parse_conflicts("<<<<<<< a
+o1
+o2
+=======
+t1
+t2
+t3
+>>>>>>> b
+").unwrap();
+        let r = region(&s, 0);
+        assert_eq!(r.pick(&[false, true], &[true, false, true], false), "o2
+t1
+t3
+");
+        assert_eq!(r.pick(&[true, false], &[false, true, false], true), "t2
+o1
+");
+        assert_eq!(r.pick(&[false, false], &[false, false, false], false), "");
+        assert_eq!(Resolution::Theirs.picks(r), (vec![false, false], vec![true, true, true]));
+    }
+
+    #[test]
+    fn lines_never_run_together() {
+        // The file ends inside the conflict, without a last line break on our side.
+        let s = parse_conflicts("<<<<<<< a
+x
+=======
+y
+>>>>>>> b
+").unwrap();
+        let mut r = region(&s, 0).clone();
+        r.ours = "x".into();
+        assert_eq!(r.resolved(Resolution::OursThenTheirs), "x
+y
+");
     }
 
     #[test]
@@ -213,13 +334,13 @@ mod tests {
         let s = parse_conflicts("<<<<<<< a\nx\n=======\ny\n>>>>>>> b").unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(region(&s, 0).theirs_label, "b");
-        assert_eq!(assemble(&s, &[Some(Resolution::OursThenTheirs)]), "x\ny\n");
+        assert_eq!(with(&s, &[Some(Resolution::OursThenTheirs)]), "x\ny\n");
     }
 
     #[test]
     fn common_text_without_trailing_newline_is_kept() {
         let s = parse_conflicts("<<<<<<< a\nx\n=======\ny\n>>>>>>> b\ntail").unwrap();
-        assert_eq!(assemble(&s, &[Some(Resolution::Theirs)]), "y\ntail");
+        assert_eq!(with(&s, &[Some(Resolution::Theirs)]), "y\ntail");
     }
 
     #[test]
@@ -228,7 +349,7 @@ mod tests {
         let r = region(&s, 0);
         assert_eq!((r.ours.as_str(), r.theirs.as_str()), ("x\r\n", "y\r\n"));
         assert_eq!((r.ours_label.as_str(), r.theirs_label.as_str()), ("HEAD", "topic"));
-        assert_eq!(assemble(&s, &[Some(Resolution::TheirsThenOurs)]), "a\r\ny\r\nx\r\nz\r\n");
+        assert_eq!(with(&s, &[Some(Resolution::TheirsThenOurs)]), "a\r\ny\r\nx\r\nz\r\n");
     }
 
     #[test]
@@ -242,12 +363,12 @@ mod tests {
     #[test]
     fn all_resolutions() {
         let s = parse_conflicts("<<<<<<< a\no\n=======\nt\n>>>>>>> b\n").unwrap();
-        let out = |r| assemble(&s, &[Some(r)]);
+        let out = |r| with(&s, &[Some(r)]);
         assert_eq!(out(Resolution::Ours), "o\n");
         assert_eq!(out(Resolution::Theirs), "t\n");
         assert_eq!(out(Resolution::OursThenTheirs), "o\nt\n");
         assert_eq!(out(Resolution::TheirsThenOurs), "t\no\n");
-        assert_eq!(assemble(&s, &[None]), "");
+        assert_eq!(with(&s, &[None]), "");
     }
 
     #[test]

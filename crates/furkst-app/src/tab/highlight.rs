@@ -4,7 +4,8 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
-use egui::Color32;
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Color32, FontId};
 use furkst_core::Hunk;
 use two_face::re_exports::syntect::easy::HighlightLines;
 use two_face::re_exports::syntect::highlighting::Theme;
@@ -38,7 +39,15 @@ fn theme(dark: bool) -> &'static Theme {
 /// Colors for every line of every hunk of the file at `path`, or `None` when its language isn't known (or the diff
 /// is too big). Hunks are highlighted one after the other, line by line, so a multi-line comment or string carries on.
 pub fn highlight(path: &str, hunks: &[Hunk], dark: bool) -> Option<Vec<Vec<Spans>>> {
-    if hunks.iter().map(|h| h.lines.len()).sum::<usize>() > MAX_LINES {
+    let shown: Vec<Vec<Cow<'_, str>>> = hunks.iter().map(|hunk| hunk.lines.iter().map(|line| display_text(&line.text)).collect()).collect();
+    let blocks: Vec<Vec<&str>> = shown.iter().map(|lines| lines.iter().map(|line| line.as_ref()).collect()).collect();
+    highlight_blocks(path, &blocks, dark)
+}
+
+/// Like [`highlight`], for blocks of lines (without line breaks) of the file at `path`; spans are offsets in the lines
+/// as given.
+pub fn highlight_blocks(path: &str, blocks: &[Vec<&str>], dark: bool) -> Option<Vec<Vec<Spans>>> {
+    if blocks.iter().map(Vec::len).sum::<usize>() > MAX_LINES {
         return None;
     }
     let syntaxes = syntaxes();
@@ -46,14 +55,13 @@ pub fn highlight(path: &str, hunks: &[Hunk], dark: bool) -> Option<Vec<Vec<Spans
     let extension = file_name.rsplit_once('.').map_or(file_name, |(_, extension)| extension);
     let syntax = syntaxes.find_syntax_by_extension(extension).or_else(|| syntaxes.find_syntax_by_extension(file_name))?;
     let theme = theme(dark);
-    let colored = hunks
+    let colored = blocks
         .iter()
-        .map(|hunk| {
+        .map(|lines| {
             let mut highlighter = HighlightLines::new(syntax, theme);
-            hunk.lines
+            lines
                 .iter()
-                .map(|line| {
-                    let text = display_text(&line.text);
+                .map(|text| {
                     if text.len() > MAX_LINE_LEN {
                         return Spans::new();
                     }
@@ -73,6 +81,30 @@ pub fn highlight(path: &str, hunks: &[Hunk], dark: bool) -> Option<Vec<Vec<Spans
         })
         .collect();
     Some(colored)
+}
+
+/// Appends `text` to `job` in its syntax colors (`spans`), the rest in `color`.
+pub fn append(job: &mut LayoutJob, text: &str, spans: Option<&Spans>, font: &FontId, color: Color32) {
+    let mut start = 0;
+    for &(end, span_color) in spans.into_iter().flatten() {
+        job.append(&text[start..end], 0.0, TextFormat::simple(font.clone(), span_color));
+        start = end;
+    }
+    job.append(&text[start..], 0.0, TextFormat::simple(font.clone(), color));
+}
+
+/// A whole text of the file at `path` laid out in its syntax colors, character for character (for an editable field).
+pub fn code_job(path: &str, text: &str, font: &FontId, color: Color32, dark: bool) -> LayoutJob {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let spans = highlight_blocks(path, std::slice::from_ref(&lines), dark).and_then(|mut blocks| blocks.pop());
+    let mut job = LayoutJob::default();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            job.append("\n", 0.0, TextFormat::simple(font.clone(), color));
+        }
+        append(&mut job, line, spans.as_ref().and_then(|spans| spans.get(index)), font, color);
+    }
+    job
 }
 
 #[cfg(test)]
