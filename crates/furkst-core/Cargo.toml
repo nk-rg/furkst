@@ -1,0 +1,22 @@
+[package]
+name = "furkst-core"
+description = "Git backend for Furkst, built on gitoxide"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aho-corasick = "1.1.5"
+chrono = "0.4.45"
+gix = "0.89.0"
+notify = "8.2.0"
+similar = "3.2.0"
+thiserror = "2.0.21"
+
+[lints]
+workspace = true
+
+[features]
+# Helpers for building commits in other crates' unit tests.
+test-support = []
