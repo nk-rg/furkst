@@ -617,8 +617,9 @@ fn resolve_in_a_merge_tool() {
     t.git(&["commit", "-am", "main"]);
     assert!(t.repo.cli().run(&["merge", "topic"]).is_err());
 
-    // A "tool" that takes their version, as a person clicking through one might.
-    let command = Some(r#"cp "$REMOTE" "$MERGED""#.to_owned());
+    // A "tool" that takes their version, as a person clicking through one might. git tells whether the tool saved
+    // the file by its modification time, which some shells (macOS's) compare by the second, so it takes one first.
+    let command = Some(r#"sleep 1 && cp "$REMOTE" "$MERGED""#.to_owned());
     t.run(Operation::MergeTool { path: "a.txt".into(), command });
     assert_eq!(t.read("a.txt"), "topic\n");
     let status = t.repo.status().unwrap();

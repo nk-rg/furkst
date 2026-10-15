@@ -47,10 +47,12 @@ Requires the latest stable Rust (edition 2024, `rust-version = 1.99`) and `git` 
 | --- | --- | --- |
 | Windows | `.\scripts\build-windows.ps1` | `dist\furkst.exe`: a single standalone file (static C runtime, no console window) |
 | macOS | `./scripts/bundle-macos.sh` | `dist/Furkst.app`: a universal binary for Apple Silicon and Intel, plus a `.zip` |
+| Linux | `./scripts/build-linux.sh` | `dist/Furkst-<version>-linux-x64.tar.gz`: the executable, a desktop entry and its icon |
 
-macOS apps must be linked on a Mac, so either run the script on one or let CI do it:
-`.github/workflows/release.yml` checks, tests and builds both platforms on every push, and attaches the builds to
-a GitHub release when a `v*` tag is pushed.
+Each platform's executable is built on that platform (macOS apps must be linked on a Mac), so either run the script
+on one or let CI do it: `.github/workflows/release.yml` lints and tests on Linux on every push, then builds all three
+platforms, and attaches the builds to a GitHub release when a `v*` tag is pushed. On Linux, building needs GTK 3 and
+the XCB and xkbcommon development packages (see the workflow for Ubuntu's names).
 
 The macOS app is ad-hoc signed but not notarized, so the first launch is blocked by Gatekeeper. Right-click the app
 and choose **Open**, or run `xattr -dr com.apple.quarantine Furkst.app`.
